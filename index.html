@@ -36,6 +36,10 @@
     background: rgba(0,0,0,0.5); padding: 8px 12px; border-radius: 6px; z-index: 10;
     max-width: 280px;
   }
+  #vignette {
+    position: fixed; inset: 0; pointer-events: none; z-index: 8; opacity: 0;
+    background: radial-gradient(ellipse at center, transparent 42%, rgba(0,0,0,0.85) 100%);
+  }
   #help {
     position: fixed; bottom: 60px; left: 16px; color: rgba(255,255,255,0.7);
     font-size: 12px; z-index: 10; line-height: 1.6;
@@ -54,9 +58,10 @@
 <div id="help">
   🙂 머리 기울기 = 핸들 (얼굴 미감지 시 손 각도)<br>
   ✊ 주먹 = 가속 / 🖐️ 펼침 = 브레이크 (한 손)<br>
-  키보드: ↑/W 가속, ↓/S 브레이크, ←→/AD 조향
+  키보드: ↑/W 가속, ↓/S 브레이크, ←→/AD 조향, C 시점 전환
 </div>
 <div id="wheel"><div id="wheelKnob"></div></div>
+<div id="vignette"></div>
 <video id="cam" autoplay playsinline muted></video>
 <canvas id="overlay" width="240" height="180"></canvas>
 
@@ -185,8 +190,24 @@ function buildCar() {
     car.add(w);
     wheels.push(w);
   }
+  // steering wheel (visible in cockpit view)
+  const sw = new THREE.Group();
+  const rim = new THREE.Mesh(new THREE.TorusGeometry(0.16, 0.028, 8, 20), dark);
+  sw.add(rim);
+  for (const a of [0, Math.PI / 2]) {
+    const spoke = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.035, 0.03), dark);
+    spoke.rotation.z = a;
+    sw.add(spoke);
+  }
+  const hub = new THREE.Mesh(new THREE.BoxGeometry(0.09, 0.09, 0.04), red);
+  sw.add(hub);
+  sw.position.set(0, 0.88, 0.35);
+  sw.rotation.x = -0.45;
+  car.add(sw);
+
   car.traverse(o => { if (o.isMesh) o.castShadow = true; });
   car.userData.wheels = wheels;
+  car.userData.steerWheel = sw;
   return car;
 }
 const car = buildCar();
@@ -196,7 +217,11 @@ scene.add(car);
 
 // ---------- Input state ----------
 const keys = {};
-addEventListener('keydown', e => keys[e.code] = true);
+let cockpitView = true;
+addEventListener('keydown', e => {
+  keys[e.code] = true;
+  if (e.code === 'KeyC') cockpitView = !cockpitView;
+});
 addEventListener('keyup', e => keys[e.code] = false);
 
 let handSteer = null;     // -1..1 or null when hands not tracked
@@ -211,6 +236,7 @@ const speedEl = document.getElementById('speed');
 const gestureEl = document.getElementById('gesture');
 const knobEl = document.getElementById('wheelKnob');
 const statusEl = document.getElementById('status');
+const vigEl = document.getElementById('vignette');
 
 let smoothSteer = 0;
 const clock = new THREE.Clock();
@@ -248,26 +274,51 @@ function tick() {
 
   // grass slowdown outside track
   const r = Math.hypot(car.position.x, car.position.z);
-  if (r < TRACK_MID - TRACK_HALF || r > TRACK_MID + TRACK_HALF) {
-    speed *= Math.max(0, 1 - 1.5 * dt);
-  }
+  const offTrack = r < TRACK_MID - TRACK_HALF || r > TRACK_MID + TRACK_HALF;
+  if (offTrack) speed *= Math.max(0, 1 - 1.5 * dt);
 
   // wheel spin
   for (const w of car.userData.wheels) w.rotation.x += speed * dt / 0.42;
+  // steering wheel turns with input
+  car.userData.steerWheel.rotation.z = -smoothSteer * 2.2;
 
-  // chase camera
-  const camDist = 9 + speed * 0.06;
-  const target = new THREE.Vector3(
-    car.position.x - Math.sin(heading) * camDist,
-    4 + speed * 0.02,
-    car.position.z - Math.cos(heading) * camDist
-  );
-  camera.position.lerp(target, Math.min(1, dt * 4));
-  camera.lookAt(car.position.x, 1.2, car.position.z);
+  // camera
+  const fwdX = Math.sin(heading), fwdZ = Math.cos(heading);
+  if (cockpitView) {
+    // driver eye + speed shake (stronger on grass)
+    const shakeAmp = (speed / MAX_SPEED) * 0.05 + (offTrack && speed > 2 ? 0.07 : 0);
+    const sx = (Math.random() * 2 - 1) * shakeAmp;
+    const sy = (Math.random() * 2 - 1) * shakeAmp;
+    camera.position.set(
+      car.position.x - fwdX * 0.15 + Math.cos(heading) * sx,
+      1.35 + sy,
+      car.position.z - fwdZ * 0.15 - Math.sin(heading) * sx
+    );
+    camera.lookAt(
+      car.position.x + fwdX * 30,
+      0.75 + sy * 8,
+      car.position.z + fwdZ * 30
+    );
+    const targetFov = 72 + (speed / MAX_SPEED) * 23;   // speed rush
+    camera.fov += (targetFov - camera.fov) * Math.min(1, dt * 5);
+    camera.updateProjectionMatrix();
+  } else {
+    const camDist = 9 + speed * 0.06;
+    const target = new THREE.Vector3(
+      car.position.x - fwdX * camDist,
+      4 + speed * 0.02,
+      car.position.z - fwdZ * camDist
+    );
+    camera.position.lerp(target, Math.min(1, dt * 4));
+    camera.lookAt(car.position.x, 1.2, car.position.z);
+    camera.fov += (70 - camera.fov) * Math.min(1, dt * 5);
+    camera.updateProjectionMatrix();
+  }
 
   // HUD
   speedEl.firstChild.textContent = Math.round(speed * 3.6) + ' ';
   knobEl.style.left = (50 + smoothSteer * 45) + '%';
+  vigEl.style.opacity = Math.min(0.85, speed / MAX_SPEED * 0.9 + (offTrack && speed > 2 ? 0.15 : 0));
 
   renderer.render(scene, camera);
 }
